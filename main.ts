@@ -6,17 +6,46 @@ import { join } from "node:path";
 
 const W = 1024;
 const H = 1024;
-type RGB = [number, number, number];
-const px = new Uint8Array(W * H * 3);
+const MAX_BYTES = 1048576;
+type RGB = readonly [number, number, number];
 
-// ---------- drawing primitives ----------
-function rect(x: number, y: number, w: number, h: number, c: RGB): void {
-  const x0 = Math.max(0, x), y0 = Math.max(0, y);
-  const x1 = Math.min(W, x + w), y1 = Math.min(H, y + h);
-  for (let j = y0; j < y1; j++) {
-    for (let i = x0; i < x1; i++) {
-      const o = (j * W + i) * 3;
-      px[o] = c[0]; px[o + 1] = c[1]; px[o + 2] = c[2];
+// ---------- canvas ----------
+class Canvas {
+  pixels = new Uint8Array(W * H * 3);
+
+  rect(x: number, y: number, w: number, h: number, c: RGB): void {
+    const x0 = Math.max(0, Math.round(x));
+    const y0 = Math.max(0, Math.round(y));
+    const x1 = Math.min(W, Math.round(x + w));
+    const y1 = Math.min(H, Math.round(y + h));
+    for (let j = y0; j < y1; j++) {
+      for (let i = x0; i < x1; i++) {
+        const o = (j * W + i) * 3;
+        this.pixels[o] = c[0];
+        this.pixels[o + 1] = c[1];
+        this.pixels[o + 2] = c[2];
+      }
+    }
+  }
+
+  hline(x: number, y: number, len: number, thickness: number, c: RGB): void {
+    this.rect(x, y, len, thickness, c);
+  }
+
+  text(s: string, x: number, y: number, scale: number, c: RGB): void {
+    const upper = s.toUpperCase();
+    for (let i = 0; i < upper.length; i++) {
+      const glyph = FONT.get(upper[i]);
+      if (!glyph) continue;
+      for (let r = 0; r < 7; r++) {
+        const bits = glyph[r];
+        if (!bits) continue;
+        for (let k = 0; k < 5; k++) {
+          if (bits & (1 << (4 - k))) {
+            this.rect(x + (i * 6 + k) * scale, y + r * scale, scale, scale, c);
+          }
+        }
+      }
     }
   }
 }
@@ -43,30 +72,14 @@ const FONT_SRC =
   "':0C,04,08,00,00,00,00";
 const FONT = new Map<string, number[]>();
 for (const entry of FONT_SRC.split(";")) {
-  const ch = entry[0];
-  FONT.set(ch, entry.slice(2).split(",").map((h) => parseInt(h, 16)));
-}
-
-function drawText(s: string, x: number, y: number, scale: number, c: RGB): void {
-  let cx = x;
-  for (const ch of s) {
-    const g = FONT.get(ch);
-    if (g) {
-      for (let r = 0; r < 7; r++) {
-        for (let k = 0; k < 5; k++) {
-          if (g[r] & (1 << (4 - k))) rect(cx + k * scale, y + r * scale, scale, scale, c);
-        }
-      }
-    }
-    cx += 6 * scale;
-  }
+  FONT.set(entry[0], entry.slice(2).split(",").map((row) => parseInt(row, 16)));
 }
 
 function textWidth(s: string, scale: number): number {
-  return s.length * 6 * scale - scale;
+  return s.length === 0 ? 0 : (s.length * 6 - 1) * scale;
 }
 
-function wrap(s: string, maxChars: number): string[] {
+function wrapWords(s: string, maxChars: number): string[] {
   const lines: string[] = [];
   let line = "";
   for (const word of s.split(" ")) {
@@ -82,89 +95,163 @@ function wrap(s: string, maxChars: number): string[] {
   return lines;
 }
 
-// ---------- content (checked against Democracy Now headlines and AAA, 24 Nov 2026) ----------
-interface Tile { tag: string; color: RGB; head: string; detail: string }
-const TILES: Tile[] = [
-  { tag: "TECH + MARKETS", color: [37, 99, 235],
-    head: "NVIDIA REINSTATES JENSEN HUANG AS CEO",
-    detail: "TRUMP CALLED INTO THE BOARD MEETING TO PUSH FOR HIS RETURN. SHARES JUMPED OVER 30%." },
-  { tag: "RUSSIA - UKRAINE", color: [220, 38, 38],
-    head: "RUSSIAN STRIKE HITS ZAPORIZHZHIA",
-    detail: "2 DEAD, 40+ HURT. MOSCOW SAYS ESTONIA IS ON THE VERGE OF TRIGGERING \"OPEN WAR\"." },
-  { tag: "GAZA", color: [5, 150, 105],
-    head: "ISRAELI STRIKE KILLS 2 POLICE IN AL-MAWASI",
-    detail: "OXFAM REPORT: TOXIC CONTAMINATION ACROSS 99% OF GAZA'S TERRITORY." },
-  { tag: "IRAN - HORMUZ", color: [234, 88, 12],
-    head: "IRAN CLAIMS TANKERS HIT MINES IN HORMUZ",
-    detail: "US NAVAL BLOCKADE OF IRANIAN PORTS CONTINUES. MINE CLAIMS NOT INDEPENDENTLY VERIFIED." },
-  { tag: "SUDAN", color: [147, 51, 234],
-    head: "RSF DRONES TARGET KHARTOUM",
-    detail: "AIRPORT AND A UN FACILITY STRUCK, AT LEAST 4 REPORTED KILLED. POWER GRID NEARS COLLAPSE." },
-  { tag: "UNITED STATES", color: [13, 148, 136],
-    head: "81.5 MILLION EXPECTED TO TRAVEL FOR THANKSGIVING",
-    detail: "AAA FORECAST FOR NOV 24-30, DOWN 0.1% FROM 2025. NEARLY 90% WILL DRIVE." },
-];
-
-// ---------- layout ----------
-// background: deterministic vertical gradient
-for (let j = 0; j < H; j++) {
-  const t = j / (H - 1);
-  rect(0, j, W, 1, [Math.round(14 + 8 * t), Math.round(20 + 10 * t), Math.round(30 + 16 * t)]);
+function requireFits(label: string, s: string, x: number, y: number, maxX: number, maxY: number, scale: number): void {
+  const right = x + textWidth(s, scale);
+  const bottom = y + 7 * scale;
+  if (right > maxX || bottom > maxY) {
+    throw new Error(`${label} does not fit: "${s}" ends at ${right},${bottom} past ${maxX},${maxY}`);
+  }
 }
+
+// ---------- content ----------
+interface Tile {
+  tag: string;
+  color: RGB;
+  head: string;
+  detail: string;
+}
+
+const TILES: Tile[] = [
+  {
+    tag: "TECH + MARKETS",
+    color: [37, 99, 235],
+    head: "NVIDIA REINSTATES JENSEN HUANG AS CEO",
+    detail: "TRUMP CALLED INTO THE BOARD MEETING TO PUSH FOR HIS RETURN. SHARES JUMPED OVER 30%.",
+  },
+  {
+    tag: "RUSSIA - UKRAINE",
+    color: [220, 38, 38],
+    head: "RUSSIAN STRIKE HITS ZAPORIZHZHIA",
+    detail: '2 DEAD, 40+ HURT. MOSCOW SAYS ESTONIA IS ON THE VERGE OF TRIGGERING "OPEN WAR".',
+  },
+  {
+    tag: "GAZA",
+    color: [5, 150, 105],
+    head: "ISRAELI STRIKE KILLS 2 POLICE IN AL-MAWASI",
+    detail: "OXFAM REPORT: TOXIC CONTAMINATION ACROSS 99% OF GAZA'S TERRITORY.",
+  },
+  {
+    tag: "IRAN - HORMUZ",
+    color: [234, 88, 12],
+    head: "IRAN CLAIMS TANKERS HIT MINES IN HORMUZ",
+    detail: "US NAVAL BLOCKADE OF IRANIAN PORTS CONTINUES. MINE CLAIMS NOT INDEPENDENTLY VERIFIED.",
+  },
+  {
+    tag: "SUDAN",
+    color: [147, 51, 234],
+    head: "RSF DRONES TARGET KHARTOUM",
+    detail: "AIRPORT AND A UN FACILITY STRUCK, AT LEAST 4 REPORTED KILLED. POWER GRID NEARS COLLAPSE.",
+  },
+  {
+    tag: "UNITED STATES",
+    color: [13, 148, 136],
+    head: "81.5 MILLION EXPECTED TO TRAVEL FOR THANKSGIVING",
+    detail: "AAA FORECAST FOR NOV 24-30, DOWN 0.1% FROM 2025. NEARLY 90% WILL DRIVE.",
+  },
+];
 
 const WHITE: RGB = [245, 247, 250];
 const GREY: RGB = [176, 186, 200];
 const CARD: RGB = [30, 38, 50];
+const GOLD: RGB = [250, 204, 21];
+const ICON_BG: RGB = [42, 52, 66];
+const M = 24;
+const GAP = 16;
+const TOP = 138;
+const TILE_W = (W - 2 * M - GAP) / 2;
+const TILE_H = 274;
 
-// title block
-rect(0, 0, W, 118, [10, 14, 22]);
-rect(0, 118, W, 4, [250, 204, 21]);
-drawText("WORLD NEWS", 24, 16, 6, WHITE);
-drawText("TUESDAY 24 NOVEMBER 2026", 24, 68, 4, [250, 204, 21]);
-drawText("IN 6 STORIES", W - 24 - textWidth("IN 6 STORIES", 3), 30, 3, GREY);
+// 7x7 pictograms, one per story, drawn at 6px per cell.
+const ICONS: string[][] = [
+  ["..###..", ".#####.", "##.#.##", "#######", "##.#.##", ".#####.", "..###.."],
+  ["..#.#..", "...#...", ".#####.", "#.###.#", ".#####.", "...#...", "..#.#.."],
+  [".##.##.", ".##.##.", ".####..", "...##..", ".####..", ".##.##.", ".##.##."],
+  [".......", "..###..", ".#####.", "#######", "..###..", ".#.#.#.", "#.#.#.#"],
+  ["##...##", "##...##", "..###..", ".#####.", "..###..", "##...##", "##...##"],
+  ["..###..", ".#####.", "##...##", "##.#.##", "##.#.##", "##...##", ".#####."],
+];
 
-// tiles: 2 columns x 3 rows
-const M = 24, G = 16, TOP = 138;
-const TW = (W - 2 * M - G) / 2;           // 480
-const TH = 274;
-for (let n = 0; n < TILES.length; n++) {
-  const t = TILES[n];
-  const x = M + (n % 2) * (TW + G);
-  const y = TOP + Math.floor(n / 2) * (TH + G);
-  rect(x, y, TW, TH, CARD);
-  rect(x, y, TW, 42, t.color);
-  drawText(t.tag, x + 16, y + 11, 3, WHITE);
-  const num = String(n + 1);
-  drawText(num, x + TW - 16 - textWidth(num, 3), y + 11, 3, WHITE);
-  let ty = y + 58;
-  for (const line of wrap(t.head, 18)) {
-    drawText(line, x + 16, ty, 4, WHITE);
-    ty += 38;
-  }
-  ty += 6;
-  rect(x + 16, ty, 56, 3, t.color);
-  ty += 14;
-  for (const line of wrap(t.detail, 36)) {
-    drawText(line, x + 16, ty, 2, GREY);
-    ty += 21;
+function drawIcon(canvas: Canvas, pattern: string[], x: number, y: number, color: RGB): void {
+  canvas.rect(x - 5, y - 5, 52, 52, ICON_BG);
+  for (let r = 0; r < pattern.length; r++) {
+    const row = pattern[r];
+    if (row.length !== 7) throw new Error("icon rows must be seven cells wide");
+    for (let c = 0; c < row.length; c++) {
+      if (row[c] === "#") canvas.rect(x + c * 6, y + r * 6, 6, 6, color);
+    }
   }
 }
 
-// footer
-drawText("SOURCES: DEMOCRACY NOW HEADLINES, AAA. IRANIAN CLAIMS UNVERIFIED.", M, 1000, 2, GREY);
+function drawTile(canvas: Canvas, tile: Tile, index: number): void {
+  const x = M + (index % 2) * (TILE_W + GAP);
+  const y = TOP + Math.floor(index / 2) * (TILE_H + GAP);
+  const innerRight = x + TILE_W - 16;
+  const innerBottom = y + TILE_H - 8;
 
-// ---------- PNG encoding (stdlib only) ----------
+  canvas.rect(x, y, TILE_W, TILE_H, CARD);
+  canvas.rect(x, y, TILE_W, 42, tile.color);
+  const number = String(index + 1);
+  requireFits("tag", tile.tag, x + 16, y + 11, innerRight - textWidth(number, 3) - 16, y + 42, 3);
+  requireFits("number", number, innerRight - textWidth(number, 3), y + 11, innerRight, y + 42, 3);
+  canvas.text(tile.tag, x + 16, y + 11, 3, WHITE);
+  canvas.text(number, innerRight - textWidth(number, 3), y + 11, 3, WHITE);
+
+  let ty = y + 58;
+  for (const line of wrapWords(tile.head, 18)) {
+    requireFits("headline", line, x + 16, ty, innerRight, innerBottom, 4);
+    canvas.text(line, x + 16, ty, 4, WHITE);
+    ty += 34;
+  }
+
+  ty += 6;
+  canvas.hline(x + 16, ty, 56, 3, tile.color);
+  ty += 14;
+  for (const line of wrapWords(tile.detail, 30)) {
+    requireFits("detail", line, x + 16, ty, x + TILE_W - 70, innerBottom, 2);
+    canvas.text(line, x + 16, ty, 2, GREY);
+    ty += 20;
+  }
+  drawIcon(canvas, ICONS[index], x + TILE_W - 62, y + TILE_H - 60, tile.color);
+}
+
+function drawImage(): Canvas {
+  const canvas = new Canvas();
+  for (let j = 0; j < H; j++) {
+    const t = j / (H - 1);
+    canvas.rect(0, j, W, 1, [Math.round(14 + 8 * t), Math.round(20 + 10 * t), Math.round(30 + 16 * t)]);
+  }
+
+  canvas.rect(0, 0, W, 118, [10, 14, 22]);
+  canvas.hline(0, 118, W, 4, GOLD);
+  canvas.text("WORLD NEWS", 24, 16, 6, WHITE);
+  canvas.text("TUESDAY 24 NOVEMBER 2026", 24, 68, 4, GOLD);
+  canvas.rect(848, 18, 152, 82, ICON_BG);
+  canvas.hline(848, 18, 152, 3, GOLD);
+  canvas.text("24", 862, 26, 8, GOLD);
+  canvas.text("NOV 2026", 862, 82, 2, WHITE);
+
+  TILES.forEach((tile, index) => drawTile(canvas, tile, index));
+
+  const footer = "SOURCES: DEMOCRACY NOW HEADLINES, AAA. IRANIAN CLAIMS UNVERIFIED.";
+  requireFits("footer", footer, M, 1000, W - M, H, 2);
+  canvas.text(footer, M, 1000, 2, GREY);
+  return canvas;
+}
+
+// ---------- PNG encoding and validation ----------
 const CRC_TABLE = new Uint32Array(256);
 for (let n = 0; n < 256; n++) {
   let c = n;
   for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
   CRC_TABLE[n] = c >>> 0;
 }
+
 function crc32(buf: Uint8Array): number {
   let c = 0xffffffff;
   for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
+
 function chunk(type: string, data: Uint8Array): Buffer {
   const len = Buffer.alloc(4);
   len.writeUInt32BE(data.length);
@@ -174,17 +261,18 @@ function chunk(type: string, data: Uint8Array): Buffer {
   return Buffer.concat([len, body, crc]);
 }
 
-function encodePng(): Buffer {
+function encodePng(pixels: Uint8Array): Buffer {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(W, 0);
   ihdr.writeUInt32BE(H, 4);
-  ihdr[8] = 8;  // bit depth
-  ihdr[9] = 2;  // truecolor RGB
-  const raw = Buffer.alloc((W * 3 + 1) * H);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // truecolor RGB
+  const stride = W * 3 + 1;
+  const raw = Buffer.alloc(stride * H);
   for (let j = 0; j < H; j++) {
-    const o = j * (W * 3 + 1);
-    raw[o] = 0; // filter: none
-    raw.set(px.subarray(j * W * 3, (j + 1) * W * 3), o + 1);
+    const row = j * stride;
+    raw[row] = 0; // filter: none
+    raw.set(pixels.subarray(j * W * 3, (j + 1) * W * 3), row + 1);
   }
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -194,6 +282,36 @@ function encodePng(): Buffer {
   ]);
 }
 
+function verifyPng(buf: Buffer): void {
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (buf.length < 33 || !buf.subarray(0, 8).equals(signature)) throw new Error("not a PNG");
+  if (buf.readUInt32BE(16) !== W || buf.readUInt32BE(20) !== H) throw new Error("wrong PNG dimensions");
+
+  let offset = 8;
+  let chunks = 0;
+  let ended = false;
+  while (offset + 12 <= buf.length) {
+    const length = buf.readUInt32BE(offset);
+    if (length > buf.length - offset - 12) throw new Error("truncated PNG chunk");
+    const type = buf.toString("ascii", offset + 4, offset + 8);
+    const data = buf.subarray(offset + 8, offset + 8 + length);
+    const expected = buf.readUInt32BE(offset + 8 + length);
+    if (crc32(Buffer.concat([Buffer.from(type, "ascii"), data])) !== expected) {
+      throw new Error(`bad CRC in ${type}`);
+    }
+    chunks++;
+    offset += 12 + length;
+    if (type === "IEND") {
+      ended = true;
+      break;
+    }
+  }
+  if (!ended || offset !== buf.length || chunks !== 3) throw new Error("incomplete PNG stream");
+  if (buf.length > MAX_BYTES) throw new Error(`PNG is ${buf.length} bytes, over ${MAX_BYTES}`);
+}
+
 const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+const png = encodePng(drawImage().pixels);
+verifyPng(png);
 mkdirSync(outDir, { recursive: true });
-writeFileSync(join(outDir, "entry.png"), encodePng());
+writeFileSync(join(outDir, "entry.png"), png);
